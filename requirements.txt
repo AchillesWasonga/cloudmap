@@ -1,1 +1,12 @@
-# Project dependencies.
+click
+PyYAML
+prompt_toolkit
+boto3
+azure-identity
+azure-mgmt-resource
+azure-mgmt-compute
+azure-mgmt-network
+azure-mgmt-storage
+azure-mgmt-containerinstance
+azure-mgmt-containerregistry
+# azure-mgmt-aks  

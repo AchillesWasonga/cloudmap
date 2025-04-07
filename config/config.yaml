@@ -1,1 +1,11 @@
-# Consolidated configuration (credentials instructions, defaults, etc.).
+# Default configuration for CloudMap
+aws:
+  region: "us-east-1"
+  # Add other AWS-specific defaults as needed
+
+azure:
+  subscription_id: "subscription_id"
+  # Add other Azure-specific defaults as needed
+
+# Credentials are not stored; they are requested at runtime.
+# This is a placeholder for the credentials section.
