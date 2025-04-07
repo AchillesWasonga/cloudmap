@@ -1,0 +1,1 @@
+# Securely handles credential input (e.g., prompts, environment variables).

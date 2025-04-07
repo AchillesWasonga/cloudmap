@@ -1,0 +1,1 @@
+# Architectural and design decisions.
