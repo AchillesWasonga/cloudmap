@@ -1,8 +1,10 @@
+# cloudmap/cli.py
+
 import click
 import yaml
 import os
 from cloudmap import credentials, logger
-from cloudmap.utils.output_formatter import format_output
+from cloudmap.utils.output_formatter import format_output, format_table
 
 log = logger.get_logger()
 
@@ -13,11 +15,12 @@ def load_config():
 
 @click.command()
 @click.option("--platform", type=click.Choice(["aws", "azure"]), required=True, help="Cloud platform to scan.")
-def main(platform):
+@click.option("--verbose", is_flag=True, help="Display detailed JSON output instead of a table summary.")
+def main(platform, verbose):
     log.info("Starting CloudMap scan for %s", platform)
     config = load_config()
     creds = credentials.get_credentials(platform)
-    
+
     if platform == "aws":
         from cloudmap.scanners.aws import run_scan_with_aws_credentials
         findings = run_scan_with_aws_credentials(config.get("aws", {}), creds)
@@ -28,7 +31,11 @@ def main(platform):
         click.echo("Unsupported platform.")
         return
 
-    click.echo(format_output(findings))
+    # Display the results using our improved formatter.
+    if verbose:
+        click.echo(format_output(findings))
+    else:
+        click.echo(format_table(findings))
 
 if __name__ == "__main__":
     main()

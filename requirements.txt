@@ -1,6 +1,7 @@
 click
 PyYAML
 prompt_toolkit
+rich
 boto3
 azure-identity
 azure-mgmt-resource
