@@ -1,0 +1,16 @@
+# config/config.yaml
+
+aws:
+  region: "us-east-1"
+  access_key: "<your-access-key>"
+  secret_key: "<your-secret-key>"
+
+azure:
+  subscription_id: "<your-subscription-id>"
+  client_id: "<your-client-id>"
+  client_secret: "<your-client-secret>"
+  tenant_id: "<your-tenant-id>"
+  resource_group: "<your-resource-group>"
+  location: "East US"
+  storage_account: "<your-storage-account>"
+  container_name: "<your-container-name>"
