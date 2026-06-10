@@ -38,6 +38,9 @@ coverage.xml
 .DS_Store
 Thumbs.db
 
+# Local design assets
+ramwinguweb.pdf
+
 # Environment variables
 *.env
 
