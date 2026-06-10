@@ -10,18 +10,17 @@ def launch_ui(platform, config, creds):
     if user_input.lower() == "exit":
         print("Scan cancelled.")
         return
-    
-    # Import and run the scanner for the platform
+
     if platform == "aws":
-        from cloudmap.scanners import aws
+        from ramwingu.scanners import aws
         findings = aws.scan(config.get("aws", {}), creds)
     elif platform == "azure":
-        from cloudmap.scanners import azure
+        from ramwingu.scanners import azure
         findings = azure.scan(config.get("azure", {}), creds)
     else:
         print("Unsupported platform.")
         return
 
-    from cloudmap.utils import format_output
+    from ramwingu.utils import format_output
     print("Scan results:")
     print(format_output(findings))

@@ -1,27 +1,27 @@
-# CloudMap
+# Ramwingu
 
-**CloudMap** is a multi-cloud misconfiguration scanner for AWS and Azure — designed to help developers, sysadmins and security engineers identify dangerous default settings and insecure configurations before attackers do.
+**Ramwingu** is an open-source multi-cloud misconfiguration scanner for AWS and Azure — designed to help developers, sysadmins and security engineers identify dangerous default settings and insecure configurations before attackers do.
 
-> Think of it as a lightweight open-source alternative to ScoutSuite, Prowler, or AzSecPack — focused, fast, and developer-friendly.
+> *Ramwingu* (Swahili: ramani ya wingu — "cloud map") — a lightweight open-source alternative to ScoutSuite, Prowler, or AzSecPack — focused, fast, and developer-friendly.
 
 ---
 
 ## Features
 
-**Multi-Cloud Support** – Scan AWS and Azure environments with a single CLI command  
-**Security Group Analysis** – Detect open inbound rules (`0.0.0.0/0`) in AWS EC2 and Azure NSGs  
-**S3 Bucket + Storage Checks** – Catch publicly accessible cloud storage  
-**IAM Review** – Find overly permissive AWS IAM policies  
-**Formatted Output** – View results in tables or JSON (for automation)  
-**Modular Design** – Easy to extend, easy to integrate
+- **Multi-Cloud Support** – Scan AWS and Azure environments with a single CLI command
+- **Security Group Analysis** – Detect open inbound rules (`0.0.0.0/0`) in AWS EC2 and Azure NSGs
+- **S3 Bucket + Storage Checks** – Catch publicly accessible cloud storage
+- **IAM Review** – Find overly permissive AWS IAM policies
+- **Formatted Output** – View results in tables or JSON (for automation)
+- **Modular Design** – Easy to extend, easy to integrate
 
 ---
 
 ## Installation
 
 ```bash
-git clone https://github.com/AchillesWasonga/cloudmap.git
-cd cloudmap
+git clone https://github.com/AchillesWasonga/ramwingu.git
+cd ramwingu
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -33,20 +33,24 @@ pip install -r requirements.txt
 
 ## Prerequisites
 
-### 🟦 Azure
+### Azure
+
 - Install [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
 - Login with:
-  ```bash
-  az login
-  ```
 
-### 🟥 AWS
+```bash
+az login
+```
+
+### AWS
+
 - Create an AWS IAM user with read-only access
 - Export credentials:
-  ```bash
-  export AWS_ACCESS_KEY_ID=your_access_key
-  export AWS_SECRET_ACCESS_KEY=your_secret_key
-  ```
+
+```bash
+export AWS_ACCESS_KEY_ID=your_access_key
+export AWS_SECRET_ACCESS_KEY=your_secret_key
+```
 
 ---
 
@@ -59,27 +63,30 @@ Edit the `config/config.yaml` file to set regions or scanner-specific options fo
 ## Usage
 
 ### Scan AWS
+
 ```bash
-python -m cloudmap.cli --platform aws
+python -m ramwingu.cli --platform aws
 ```
 
 ### Scan Azure
+
 ```bash
-python -m cloudmap.cli --platform azure
+python -m ramwingu.cli --platform azure
 ```
 
 ### Verbose (JSON) Output
+
 ```bash
-python -m cloudmap.cli --platform aws --verbose
+python -m ramwingu.cli --platform aws --verbose
 ```
 
 ---
 
 ## Project Structure
 
-```
-cloudmap/
-├── cloudmap/
+```text
+ramwingu/
+├── ramwingu/
 │   ├── scanners/              # AWS and Azure scanners
 │   ├── utils/                 # Output and misconfiguration helpers
 │   ├── cli.py                 # Command-line interface
@@ -95,6 +102,7 @@ cloudmap/
 ## Contributing
 
 Pull requests are welcome! If you'd like to:
+
 - Add new cloud providers
 - Expand misconfiguration rules
 - Improve output visualization
@@ -103,25 +111,22 @@ Create an issue or fork and PR!
 
 ---
 
-## 🛡️ License
+## License
 
 MIT License. Free for personal and commercial use.
 
 ---
 
-## 💬 Acknowledgments
+## Acknowledgments
 
 Inspired by security tools like:
+
 - [ScoutSuite](https://github.com/nccgroup/ScoutSuite)
 - [Prowler](https://github.com/prowler-cloud/prowler)
 - [AzSecPack](https://github.com/azsec/azure-security-pack)
 
 ---
 
-## 👨‍💻 Author
+## Author
 
 **Achilles** – [GitHub](https://github.com/AchillesWasonga) · [LinkedIn](https://www.linkedin.com/in/allan-wasonga-2b31252bb/)
-
-```
-
----

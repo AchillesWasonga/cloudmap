@@ -1,7 +1,7 @@
 import logging
 
 def get_logger():
-    logger = logging.getLogger("cloudmap")
+    logger = logging.getLogger("ramwingu")
     if not logger.handlers:
         # Create console handler with a higher log level
         ch = logging.StreamHandler()

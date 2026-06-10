@@ -1,5 +1,5 @@
 import unittest
-from cloudmap import utils
+from ramwingu import utils
 
 class TestUtils(unittest.TestCase):
     def test_format_output(self):

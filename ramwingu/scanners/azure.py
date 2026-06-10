@@ -16,7 +16,7 @@ from azure.mgmt.network import NetworkManagementClient
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.storage import StorageManagementClient
 
-logger = logging.getLogger("cloudmap.azure")
+logger = logging.getLogger("ramwingu.azure")
 
 def ensure_az_login():
     """

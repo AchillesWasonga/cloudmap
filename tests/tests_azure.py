@@ -1,5 +1,5 @@
 import unittest
-from cloudmap.scanners import azure
+from ramwingu.scanners import azure
 
 class TestAzureScanner(unittest.TestCase):
     def test_scan_returns_findings(self):

@@ -1,5 +1,5 @@
 import unittest
-from cloudmap.scanners import aws
+from ramwingu.scanners import aws
 
 class TestAWSScanner(unittest.TestCase):
     def test_scan_returns_findings(self):

@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="cloudmap",
+    name="ramwingu",
     version="0.1.0",
     packages=find_packages(),
     install_requires=[
@@ -14,9 +14,9 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "cloudmap=cloudmap.cli:main",
+            "ramwingu=ramwingu.cli:main",
         ],
     },
     author="Allan Wasonga",
-    description="A cloud misconfiguration scanner for AWS and Azure",
+    description="Open-source multi-cloud misconfiguration scanner for AWS and Azure",
 )

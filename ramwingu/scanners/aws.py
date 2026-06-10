@@ -11,7 +11,7 @@ import logging
 import boto3
 from botocore.exceptions import ClientError
 
-logger = logging.getLogger("cloudmap.aws")
+logger = logging.getLogger("ramwingu.aws")
 
 def scan(config, creds):
     """
