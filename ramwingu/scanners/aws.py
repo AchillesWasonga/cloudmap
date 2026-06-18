@@ -11,6 +11,8 @@ import logging
 import boto3
 from botocore.exceptions import ClientError
 
+from ramwingu.utils.misconfiguration_checks import check_instance_metadata
+
 logger = logging.getLogger("ramwingu.aws")
 
 def scan(config, creds):
@@ -100,6 +102,15 @@ def scan(config, creds):
         if not iam_findings:
             iam_findings.append("No overly permissive IAM policies found.")
         findings["iam_policies"] = iam_findings
+
+        # ------------------------------
+        # 4. Check EC2 Instance Metadata (IMDSv2 enforcement)
+        # ------------------------------
+        instances = []
+        instances_response = ec2_client.describe_instances()
+        for reservation in instances_response.get("Reservations", []):
+            instances.extend(reservation.get("Instances", []))
+        findings["instance_metadata"] = check_instance_metadata(instances)
 
     except Exception as e:
         logger.error("Error during AWS scan: %s", e)
