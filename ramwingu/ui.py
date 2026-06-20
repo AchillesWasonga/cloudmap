@@ -12,15 +12,15 @@ def launch_ui(platform, config, creds):
         return
 
     if platform == "aws":
-        from ramwingu.scanners import aws
-        findings = aws.scan(config.get("aws", {}), creds)
+        from ramwingu.scanners.aws import run_scan_with_aws_credentials
+        findings = run_scan_with_aws_credentials(config.get("aws", {}), creds)
     elif platform == "azure":
-        from ramwingu.scanners import azure
-        findings = azure.scan(config.get("azure", {}), creds)
+        from ramwingu.scanners.azure import run_scan_with_az_login
+        findings = run_scan_with_az_login(config.get("azure", {}), creds)
     else:
         print("Unsupported platform.")
         return
 
-    from ramwingu.utils import format_output
+    from ramwingu.utils.output_formatter import format_output
     print("Scan results:")
     print(format_output(findings))

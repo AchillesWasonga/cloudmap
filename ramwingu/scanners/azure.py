@@ -3,7 +3,7 @@ Azure Scanner Module
 
 This module uses the Azure SDK to authenticate and scan for common misconfigurations:
   - Overly permissive NSG rules (inbound rules open to 0.0.0.0/0 or "*")
-  - Public access configurations on Storage Accounts
+  - Storage account exposure (Shared Key auth, public blob access, open public network)
 
 It includes functions to prompt for Azure CLI login, set the subscription, and logout afterward.
 """
@@ -78,20 +78,9 @@ def run_scan_with_az_login(config, creds):
         findings["nsg_rules"] = check_nsg_rules(all_nsgs)
 
         # ------------------------------
-        # 2. Check Storage Accounts for Public Access
+        # 2. Check Storage Accounts (Shared Key auth + public blob/network)
         # ------------------------------
-        storage_issues = []
-        storage_accounts = list(storage_client.storage_accounts.list())
-        for sa in storage_accounts:
-            sa_name = sa.name
-            rg_name = sa.id.split("/")[4]  # Extract resource group from the resource ID.
-            sa_properties = storage_client.storage_accounts.get_properties(rg_name, sa_name)
-            network_rules = getattr(sa_properties, "network_rule_set", None)
-            if network_rules and network_rules.default_action.lower() == "allow":
-                storage_issues.append(f"Storage account {sa_name} in resource group {rg_name} allows public access by default.")
-        if not storage_issues:
-            storage_issues.append("No publicly accessible storage accounts found.")
-        findings["storage_accounts"] = storage_issues
+        findings["storage_accounts"] = check_storage_accounts(storage_client)
 
     except Exception as e:
         logger.error("Error during Azure scan: %s", e)
@@ -118,4 +107,67 @@ def check_nsg_rules(nsgs):
                     )
     if not issues:
         issues.append("No overly permissive NSG rules found.")
+    return issues
+
+
+def check_storage_accounts(storage_client):
+    """
+    Checks Azure Storage accounts for insecure data-plane exposure.
+
+    Three high-signal misconfigurations are flagged:
+
+      * **Shared Key authorization allowed** -- account access keys grant full,
+        un-scoped, un-audited access to all data in the account. The
+        ``allowSharedKeyAccess`` property is unset (null) by default and a null
+        value is treated as *permitted*, so the insecure posture is the default.
+        Microsoft's guidance is to disable it and use Entra ID (RBAC).
+      * **Anonymous public blob access** -- ``allowBlobPublicAccess`` true lets
+        containers/blobs be read with no credentials.
+      * **Open public network access** -- the account is reachable from any network
+        (``publicNetworkAccess`` enabled) with a default-allow network rule set.
+
+    :param storage_client: An initialized ``StorageManagementClient``.
+    :return: List of detected issues.
+    """
+    issues = []
+    for sa in storage_client.storage_accounts.list():
+        sa_name = sa.name
+        rg_name = sa.id.split("/")[4]  # Resource group sits at index 4 of the ID.
+        props = storage_client.storage_accounts.get_properties(rg_name, sa_name)
+
+        # 1. Shared Key authorization -- null (default) or True both permit it.
+        if getattr(props, "allow_shared_key_access", None) in (None, True):
+            issues.append(
+                f"Storage account {sa_name} (resource group {rg_name}) permits Shared "
+                f"Key authorization (allow_shared_key_access is not disabled); disable "
+                f"it and use Entra ID (RBAC)."
+            )
+
+        # 2. Anonymous public blob access.
+        if getattr(props, "allow_blob_public_access", None) is True:
+            issues.append(
+                f"Storage account {sa_name} (resource group {rg_name}) allows anonymous "
+                f"public blob access (allow_blob_public_access is True); disable public "
+                f"blob access."
+            )
+
+        # 3. Reachable from any network with no default-deny network rule.
+        public_network = getattr(props, "public_network_access", None)
+        network_rules = getattr(props, "network_rule_set", None)
+        default_action = getattr(network_rules, "default_action", None)
+        reachable = public_network is None or str(public_network).lower() == "enabled"
+        no_network_restriction = network_rules is None or (
+            default_action is not None and str(default_action).lower() == "allow"
+        )
+        if reachable and no_network_restriction:
+            shown = public_network if public_network is not None else "Enabled (default)"
+            issues.append(
+                f"Storage account {sa_name} (resource group {rg_name}) is reachable from "
+                f"any network (public_network_access is '{shown}' with a default-allow "
+                f"network rule set); restrict with network rules or disable public "
+                f"network access."
+            )
+
+    if not issues:
+        issues.append("No insecure storage account configurations found.")
     return issues
