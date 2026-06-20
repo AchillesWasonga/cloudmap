@@ -11,9 +11,49 @@ import logging
 import boto3
 from botocore.exceptions import ClientError
 
-from ramwingu.utils.misconfiguration_checks import check_instance_metadata
-
 logger = logging.getLogger("ramwingu.aws")
+
+
+def check_instance_metadata(instances):
+    """
+    Checks EC2 instances for weak Instance Metadata Service (IMDS) settings.
+
+    The metadata service exposes the instance's IAM role credentials at
+    169.254.169.254. While IMDSv1 is still allowed, a server-side request forgery
+    (SSRF) in any app on the instance can reach that endpoint and steal those
+    credentials. Enforcing IMDSv2 (``HttpTokens=required``) and a low hop limit is
+    the durable defense.
+
+    :param instances: List of EC2 instance dicts (from ``describe_instances``).
+    :return: List of detected issues.
+    """
+    issues = []
+    for instance in instances:
+        instance_id = instance.get("InstanceId", "Unknown")
+        options = instance.get("MetadataOptions", {})
+
+        # IMDSv1 still usable -> an SSRF can mint credential tokens (high risk).
+        if options.get("HttpTokens") != "required":
+            issues.append(
+                f"EC2 instance {instance_id} allows IMDSv1 "
+                f"(MetadataOptions.HttpTokens is "
+                f"'{options.get('HttpTokens', 'optional')}', not 'required'); "
+                f"enforce IMDSv2 to prevent SSRF credential theft."
+            )
+
+        # Permissive hop limit while the endpoint is reachable (lower-signal note).
+        if options.get("HttpEndpoint", "enabled") != "disabled":
+            hop_limit = options.get("HttpPutResponseHopLimit")
+            if isinstance(hop_limit, int) and hop_limit > 1:
+                issues.append(
+                    f"EC2 instance {instance_id} has a metadata hop limit of "
+                    f"{hop_limit} (greater than 1); lower it to 1 unless containers "
+                    f"on the host require more."
+                )
+
+    if not issues:
+        issues.append("No insecure EC2 instance metadata configurations found.")
+    return issues
 
 def scan(config, creds):
     """
