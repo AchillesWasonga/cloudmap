@@ -89,22 +89,150 @@ def run_scan_with_az_login(config, creds):
     logout_az()
     return findings
 
+# Source prefixes that expose an inbound rule to the entire internet. "*" (Any)
+# and the "Internet" service tag cover both address families; "0.0.0.0/0" is
+# IPv4-any and "::/0" is its IPv6 equivalent (the IPv6 form was previously
+# missed). Compared case-insensitively so the "Internet" tag matches any casing.
+_WORLD_OPEN_SOURCE_PREFIXES = frozenset({"0.0.0.0/0", "*", "::/0", "internet"})
+
+
+def _rule_source_prefixes(rule):
+    """
+    Collects every source prefix declared on an NSG rule.
+
+    Azure rules carry a source either as a single ``source_address_prefix`` or as
+    a list in ``source_address_prefixes`` (plural). The original check only read
+    the singular field, so a world-open rule expressed via the plural list slipped
+    through entirely; this gathers both.
+
+    :param rule: An NSG security-rule object from the Azure SDK.
+    :return: List of source-prefix strings.
+    """
+    prefixes = []
+    single = getattr(rule, "source_address_prefix", None)
+    if single:
+        prefixes.append(single)
+    prefixes.extend(getattr(rule, "source_address_prefixes", None) or [])
+    return prefixes
+
+
+# World-open inbound exposure to these ports is treated as HIGH severity: they
+# front remote-admin, database, and similar sensitive services that get probed and
+# popped quickly once reachable from the internet. (Per the standalone-scanner
+# design rule this port-risk model is intentionally duplicated from aws.py rather
+# than shared -- keep the two in sync by hand, do not extract a shared module.)
+_HIGH_RISK_PORTS = frozenset(
+    {
+        22,     # SSH
+        23,     # Telnet
+        445,    # SMB
+        1433,   # MSSQL
+        1521,   # Oracle DB
+        3306,   # MySQL / MariaDB
+        3389,   # RDP
+        5432,   # PostgreSQL
+        5601,   # Kibana
+        5984,   # CouchDB
+        6379,   # Redis
+        6789,   # privileged unauth service cited in the source intel
+        9200,   # Elasticsearch HTTP
+        9300,   # Elasticsearch transport
+        11211,  # Memcached
+        27017,  # MongoDB
+    }
+)
+
+# World-open exposure here is commonly an intentional public-web decision, so it is
+# still reported but at LOW severity to keep the high-risk signal from drowning.
+_LOW_RISK_PORTS = frozenset({80, 443})
+
+
+def _rule_dest_port_specs(rule):
+    """
+    Collects every destination-port spec on an NSG rule, from both the singular
+    ``destination_port_range`` and the plural ``destination_port_ranges`` list.
+
+    :param rule: An NSG security-rule object from the Azure SDK.
+    :return: List of port-spec strings (e.g. ``"22"``, ``"8000-8100"``, ``"*"``).
+    """
+    specs = []
+    single = getattr(rule, "destination_port_range", None)
+    if single:
+        specs.append(str(single))
+    specs.extend(str(s) for s in (getattr(rule, "destination_port_ranges", None) or []))
+    return specs
+
+
+def _port_bounds(spec):
+    """Parses an Azure port spec into an inclusive ``(lo, hi)`` range; ``"*"`` is
+    all ports."""
+    spec = spec.strip()
+    if spec == "*":
+        return (0, 65535)
+    if "-" in spec:
+        low, high = spec.split("-", 1)
+        return (int(low), int(high))
+    return (int(spec), int(spec))
+
+
+def _severity_for_rule(rule):
+    """
+    Classifies a world-open inbound NSG rule into HIGH / MEDIUM / LOW by the ports
+    it exposes (same model as the AWS scanner).
+
+    HIGH if any spec reaches a high-risk port (or exposes all ports); LOW if every
+    exposed port is an expected public-web port (80/443); MEDIUM otherwise. An
+    unparseable or unspecified port set defaults to HIGH (assume broad exposure).
+
+    :param rule: An NSG security-rule object from the Azure SDK.
+    :return: Severity string.
+    """
+    specs = _rule_dest_port_specs(rule)
+    if not specs:
+        return "HIGH"
+    try:
+        bounds = [_port_bounds(spec) for spec in specs]
+    except (ValueError, TypeError):
+        return "HIGH"
+    if any(low <= port <= high for (low, high) in bounds for port in _HIGH_RISK_PORTS):
+        return "HIGH"
+    if all(
+        port in _LOW_RISK_PORTS
+        for (low, high) in bounds
+        for port in range(low, high + 1)
+    ):
+        return "LOW"
+    return "MEDIUM"
+
+
 def check_nsg_rules(nsgs):
     """
-    Checks Azure NSG rules for overly permissive inbound traffic.
-    
+    Checks Azure NSG rules for overly permissive inbound traffic, tagged with a
+    port-aware severity.
+
+    Flags any inbound rule whose source is open to the entire internet across
+    both address families and both the singular ``source_address_prefix`` and the
+    plural ``source_address_prefixes`` list (see ``_WORLD_OPEN_SOURCE_PREFIXES``).
+    Each finding is prefixed with a ``[HIGH]`` / ``[MEDIUM]`` / ``[LOW]`` severity
+    derived from the exposed ports.
+
     :param nsgs: List of NSG objects from the Azure SDK.
     :return: List of detected issues.
     """
     issues = []
     for nsg in nsgs:
         for rule in getattr(nsg, "security_rules", []):
-            if rule.direction.lower() == "inbound":
-                if rule.source_address_prefix in ["0.0.0.0/0", "*"]:
-                    issues.append(
-                        f"NSG '{nsg.name}' in resource group '{nsg.id.split('/')[4]}' has open inbound rule '{rule.name}' "
-                        f"allowing {rule.protocol} on port(s) {rule.destination_port_range}."
-                    )
+            if rule.direction.lower() != "inbound":
+                continue
+            prefixes = _rule_source_prefixes(rule)
+            if not any(p.lower() in _WORLD_OPEN_SOURCE_PREFIXES for p in prefixes):
+                continue
+            severity = _severity_for_rule(rule)
+            ports = ", ".join(_rule_dest_port_specs(rule)) or "*"
+            issues.append(
+                f"[{severity}] NSG '{nsg.name}' in resource group '{nsg.id.split('/')[4]}' "
+                f"has open inbound rule '{rule.name}' allowing {rule.protocol} on port(s) {ports}."
+            )
     if not issues:
         issues.append("No overly permissive NSG rules found.")
     return issues

@@ -146,6 +146,118 @@ def check_bucket_policy_confused_deputy(buckets, s3_client):
     return issues
 
 
+# World-open inbound exposure to these ports is treated as HIGH severity: they
+# front remote-admin, database, and similar sensitive services that get probed and
+# popped quickly once reachable from the internet. (Per the standalone-scanner
+# design rule this port-risk model is intentionally duplicated in azure.py rather
+# than shared -- keep the two in sync by hand, do not extract a shared module.)
+_HIGH_RISK_PORTS = frozenset(
+    {
+        22,     # SSH
+        23,     # Telnet
+        445,    # SMB
+        1433,   # MSSQL
+        1521,   # Oracle DB
+        3306,   # MySQL / MariaDB
+        3389,   # RDP
+        5432,   # PostgreSQL
+        5601,   # Kibana
+        5984,   # CouchDB
+        6379,   # Redis
+        6789,   # privileged unauth service cited in the source intel
+        9200,   # Elasticsearch HTTP
+        9300,   # Elasticsearch transport
+        11211,  # Memcached
+        27017,  # MongoDB
+    }
+)
+
+# World-open exposure here is commonly an intentional public-web decision, so it is
+# still reported but at LOW severity to keep the high-risk signal from drowning.
+_LOW_RISK_PORTS = frozenset({80, 443})
+
+
+def _severity_for_permission(permission):
+    """
+    Classifies a world-open inbound permission into HIGH / MEDIUM / LOW by the
+    ports it exposes.
+
+    HIGH if the rule reaches any high-risk port (or exposes all ports, e.g. an
+    all-protocols ``-1`` rule); LOW if it only reaches expected public-web ports
+    (80/443); MEDIUM otherwise.
+
+    :param permission: An IpPermission dict (from ``describe_security_groups``).
+    :return: Severity string.
+    """
+    from_port = permission.get("FromPort")
+    to_port = permission.get("ToPort")
+    # "-1" (all protocols) or an unscoped range exposes every port -> high-risk set.
+    if permission.get("IpProtocol") == "-1" or from_port is None or to_port is None:
+        return "HIGH"
+    if any(from_port <= port <= to_port for port in _HIGH_RISK_PORTS):
+        return "HIGH"
+    if all(port in _LOW_RISK_PORTS for port in range(from_port, to_port + 1)):
+        return "LOW"
+    return "MEDIUM"
+
+
+def _describe_ports(permission):
+    """Renders a permission's port range for a finding message."""
+    from_port = permission.get("FromPort")
+    to_port = permission.get("ToPort")
+    if permission.get("IpProtocol") == "-1" or from_port is None or to_port is None:
+        return "all ports"
+    if from_port == to_port:
+        return f"port {from_port}"
+    return f"ports {from_port}-{to_port}"
+
+
+def check_security_groups(security_groups):
+    """
+    Flags security group inbound rules open to the entire internet, tagged with a
+    port-aware severity.
+
+    Inspects both address families: IPv4 (``IpRanges`` with
+    ``CidrIp == "0.0.0.0/0"``) and IPv6 (``Ipv6Ranges`` with
+    ``CidrIpv6 == "::/0"``). A rule open to ``::/0`` is the exact IPv6 equivalent
+    of ``0.0.0.0/0`` and carries identical exposure, but was previously missed
+    because only IPv4 ranges were inspected. Each finding is prefixed with a
+    ``[HIGH]`` / ``[MEDIUM]`` / ``[LOW]`` severity derived from the exposed ports.
+
+    :param security_groups: List of SG dicts (from ``describe_security_groups``).
+    :return: List of detected issues.
+    """
+    issues = []
+    for sg in security_groups:
+        group_id = sg.get("GroupId", "Unknown")
+        for permission in sg.get("IpPermissions", []):
+            ipv4_open = any(
+                r.get("CidrIp") == "0.0.0.0/0" for r in permission.get("IpRanges", [])
+            )
+            ipv6_open = any(
+                r.get("CidrIpv6") == "::/0" for r in permission.get("Ipv6Ranges", [])
+            )
+            if not (ipv4_open or ipv6_open):
+                continue
+
+            severity = _severity_for_permission(permission)
+            ports = _describe_ports(permission)
+            if ipv4_open:
+                issues.append(
+                    f"[{severity}] Security Group {group_id} has open rule on "
+                    f"{ports}: {permission}"
+                )
+            if ipv6_open:
+                issues.append(
+                    f"[{severity}] Security Group {group_id} has open IPv6 rule on "
+                    f"{ports}: {permission}"
+                )
+
+    if not issues:
+        issues.append("No overly permissive security group rules found.")
+    return issues
+
+
 def scan(config, creds):
     """
     Performs an AWS scan for common misconfigurations.
@@ -182,17 +294,7 @@ def scan(config, creds):
         # ------------------------------
         sg_response = ec2_client.describe_security_groups()
         security_groups = sg_response.get("SecurityGroups", [])
-        sg_findings = []
-        for sg in security_groups:
-            group_id = sg.get("GroupId", "Unknown")
-            for permission in sg.get("IpPermissions", []):
-                for ip_range in permission.get("IpRanges", []):
-                    cidr = ip_range.get("CidrIp", "")
-                    if cidr == "0.0.0.0/0":
-                        sg_findings.append(f"Security Group {group_id} has open rule: {permission}")
-        if not sg_findings:
-            sg_findings.append("No overly permissive security group rules found.")
-        findings["security_groups"] = sg_findings
+        findings["security_groups"] = check_security_groups(security_groups)
 
         # ------------------------------
         # 2. Check S3 Buckets
