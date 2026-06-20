@@ -7,10 +7,12 @@ from ramwingu.scanners import aws
 from ramwingu.scanners.aws import (
     check_bucket_policy_confused_deputy,
     check_instance_metadata,
+    check_security_groups,
 )
 
 CLEAN_METADATA = "No insecure EC2 instance metadata configurations found."
 CLEAN_POLICY = "No confused-deputy S3 bucket policies found."
+CLEAN_SG = "No overly permissive security group rules found."
 
 
 class _FakeS3Client:
@@ -115,6 +117,151 @@ class TestInstanceMetadataCheck(unittest.TestCase):
 
     def test_no_instances_is_clean(self):
         self.assertEqual(check_instance_metadata([]), [CLEAN_METADATA])
+
+
+class TestSecurityGroupsCheck(unittest.TestCase):
+    def test_flags_ipv4_world_open(self):
+        sgs = [
+            {
+                "GroupId": "sg-0v4",
+                "IpPermissions": [
+                    {"IpProtocol": "tcp", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+                ],
+            }
+        ]
+        issues = check_security_groups(sgs)
+        self.assertTrue(any("sg-0v4" in i and "open rule" in i for i in issues))
+
+    def test_flags_ipv6_world_open(self):
+        # ::/0 lives in Ipv6Ranges -- previously missed entirely.
+        sgs = [
+            {
+                "GroupId": "sg-0v6",
+                "IpPermissions": [
+                    {"IpProtocol": "tcp", "Ipv6Ranges": [{"CidrIpv6": "::/0"}]}
+                ],
+            }
+        ]
+        issues = check_security_groups(sgs)
+        self.assertTrue(any("sg-0v6" in i and "open IPv6 rule" in i for i in issues))
+
+    def test_flags_both_families_in_one_permission(self):
+        sgs = [
+            {
+                "GroupId": "sg-0both",
+                "IpPermissions": [
+                    {
+                        "IpProtocol": "tcp",
+                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                        "Ipv6Ranges": [{"CidrIpv6": "::/0"}],
+                    }
+                ],
+            }
+        ]
+        issues = check_security_groups(sgs)
+        self.assertEqual(len(issues), 2)
+        self.assertTrue(any("open IPv6 rule" in i for i in issues))
+        self.assertTrue(any("has open rule on" in i and "IPv6" not in i for i in issues))
+
+    def test_high_risk_port_is_high_severity(self):
+        sgs = [
+            {
+                "GroupId": "sg-ssh",
+                "IpPermissions": [
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": 22,
+                        "ToPort": 22,
+                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                    }
+                ],
+            }
+        ]
+        issues = check_security_groups(sgs)
+        self.assertTrue(any(i.startswith("[HIGH]") and "port 22" in i for i in issues))
+
+    def test_web_port_is_low_severity(self):
+        sgs = [
+            {
+                "GroupId": "sg-web",
+                "IpPermissions": [
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": 443,
+                        "ToPort": 443,
+                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                    }
+                ],
+            }
+        ]
+        issues = check_security_groups(sgs)
+        self.assertTrue(any(i.startswith("[LOW]") for i in issues))
+
+    def test_other_port_is_medium_severity(self):
+        sgs = [
+            {
+                "GroupId": "sg-other",
+                "IpPermissions": [
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": 8080,
+                        "ToPort": 8080,
+                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                    }
+                ],
+            }
+        ]
+        issues = check_security_groups(sgs)
+        self.assertTrue(any(i.startswith("[MEDIUM]") for i in issues))
+
+    def test_all_protocols_rule_is_high_severity(self):
+        # IpProtocol "-1" exposes every port -> includes the high-risk set.
+        sgs = [
+            {
+                "GroupId": "sg-all",
+                "IpPermissions": [
+                    {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+                ],
+            }
+        ]
+        issues = check_security_groups(sgs)
+        self.assertTrue(any(i.startswith("[HIGH]") and "all ports" in i for i in issues))
+
+    def test_high_risk_within_range_is_high_severity(self):
+        # A wide range that straddles a high-risk port (3389/RDP) is HIGH.
+        sgs = [
+            {
+                "GroupId": "sg-range",
+                "IpPermissions": [
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": 3380,
+                        "ToPort": 3400,
+                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                    }
+                ],
+            }
+        ]
+        issues = check_security_groups(sgs)
+        self.assertTrue(any(i.startswith("[HIGH]") for i in issues))
+
+    def test_scoped_ranges_are_clean(self):
+        sgs = [
+            {
+                "GroupId": "sg-0safe",
+                "IpPermissions": [
+                    {
+                        "IpProtocol": "tcp",
+                        "IpRanges": [{"CidrIp": "10.0.0.0/8"}],
+                        "Ipv6Ranges": [{"CidrIpv6": "2001:db8::/32"}],
+                    }
+                ],
+            }
+        ]
+        self.assertEqual(check_security_groups(sgs), [CLEAN_SG])
+
+    def test_no_security_groups_is_clean(self):
+        self.assertEqual(check_security_groups([]), [CLEAN_SG])
 
 
 class TestBucketPolicyConfusedDeputy(unittest.TestCase):
