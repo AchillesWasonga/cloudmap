@@ -7,12 +7,40 @@ from ramwingu.scanners import aws
 from ramwingu.scanners.aws import (
     check_bucket_policy_confused_deputy,
     check_instance_metadata,
+    check_s3_public_access,
     check_security_groups,
 )
 
 CLEAN_METADATA = "No insecure EC2 instance metadata configurations found."
 CLEAN_POLICY = "No confused-deputy S3 bucket policies found."
 CLEAN_SG = "No overly permissive security group rules found."
+CLEAN_PUBLIC = "No public S3 access exposure found."
+
+_ALL_USERS_GRANT = {
+    "Grantee": {
+        "Type": "Group",
+        "URI": "http://acs.amazonaws.com/groups/global/AllUsers",
+    },
+    "Permission": "READ",
+}
+_BPA_FULL = {
+    "BlockPublicAcls": True,
+    "IgnorePublicAcls": True,
+    "BlockPublicPolicy": True,
+    "RestrictPublicBuckets": True,
+}
+
+
+def _public_policy(condition=None):
+    statement = {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::my-bucket/*",
+    }
+    if condition is not None:
+        statement["Condition"] = condition
+    return {"Version": "2012-10-17", "Statement": [statement]}
 
 
 class _FakeS3Client:
@@ -117,6 +145,187 @@ class TestInstanceMetadataCheck(unittest.TestCase):
 
     def test_no_instances_is_clean(self):
         self.assertEqual(check_instance_metadata([]), [CLEAN_METADATA])
+
+    def test_imdsv1_finding_is_high_severity(self):
+        issues = check_instance_metadata([{"InstanceId": "i-0sev"}])
+        self.assertTrue(any(i.startswith("[HIGH]") and "i-0sev" in i for i in issues))
+
+    def test_imdsv1_admin_profile_is_critical_blast_radius(self):
+        arn = "arn:aws:iam::111122223333:instance-profile/admin-profile"
+        instances = [
+            {
+                "InstanceId": "i-0adm",
+                "MetadataOptions": {"HttpTokens": "optional"},
+                "IamInstanceProfile": {"Arn": arn},
+            }
+        ]
+        issues = check_instance_metadata(instances, {arn})
+        self.assertTrue(
+            any(
+                "i-0adm" in i and "AdministratorAccess" in i and arn in i
+                for i in issues
+            )
+        )
+
+    def test_imdsv1_nonadmin_profile_is_annotated(self):
+        arn = "arn:aws:iam::111122223333:instance-profile/app-profile"
+        instances = [
+            {
+                "InstanceId": "i-0app",
+                "MetadataOptions": {"HttpTokens": "optional"},
+                "IamInstanceProfile": {"Arn": arn},
+            }
+        ]
+        issues = check_instance_metadata(instances, frozenset())
+        self.assertTrue(
+            any(
+                "i-0app" in i and arn in i and "AdministratorAccess" not in i
+                for i in issues
+            )
+        )
+
+    def test_imdsv1_without_profile_notes_no_role(self):
+        issues = check_instance_metadata([{"InstanceId": "i-0nor"}])
+        self.assertTrue(
+            any("i-0nor" in i and "No instance profile" in i for i in issues)
+        )
+
+    def test_hop_limit_finding_is_medium_severity(self):
+        instances = [
+            {
+                "InstanceId": "i-0hopsev",
+                "MetadataOptions": {
+                    "HttpTokens": "required",
+                    "HttpEndpoint": "enabled",
+                    "HttpPutResponseHopLimit": 3,
+                },
+            }
+        ]
+        issues = check_instance_metadata(instances)
+        self.assertTrue(any(i.startswith("[MEDIUM]") for i in issues))
+
+
+class _FakePublicS3Client:
+    """Stand-in for a boto3 S3 client over the public-access surface.
+
+    Each mapping is keyed by bucket name. ``blocks`` maps to a
+    PublicAccessBlockConfiguration dict (or ``None`` to raise
+    ``NoSuchPublicAccessBlockConfiguration``); ``acls`` to a get_bucket_acl
+    response; ``policies`` to a policy dict (or ``None`` for no policy).
+    """
+
+    def __init__(self, blocks=None, acls=None, policies=None):
+        self._blocks = blocks or {}
+        self._acls = acls or {}
+        self._policies = policies or {}
+
+    def get_public_access_block(self, Bucket):
+        block = self._blocks.get(Bucket)
+        if block is None:
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "NoSuchPublicAccessBlockConfiguration",
+                        "Message": "none",
+                    }
+                },
+                "GetPublicAccessBlock",
+            )
+        return {"PublicAccessBlockConfiguration": block}
+
+    def get_bucket_acl(self, Bucket):
+        return self._acls.get(Bucket, {"Grants": []})
+
+    def get_bucket_policy(self, Bucket):
+        policy = self._policies.get(Bucket)
+        if policy is None:
+            raise ClientError(
+                {"Error": {"Code": "NoSuchBucketPolicy", "Message": "no policy"}},
+                "GetBucketPolicy",
+            )
+        return {"Policy": json.dumps(policy)}
+
+
+class TestS3PublicAccessCheck(unittest.TestCase):
+    def test_account_bpa_off_is_medium(self):
+        issues = check_s3_public_access([], _FakePublicS3Client(), account_block=None)
+        self.assertTrue(
+            any(i.startswith("[MEDIUM]") and "Account-level" in i for i in issues)
+        )
+
+    def test_account_bpa_full_and_no_buckets_is_clean(self):
+        issues = check_s3_public_access(
+            [], _FakePublicS3Client(), account_block=_BPA_FULL
+        )
+        self.assertEqual(issues, [CLEAN_PUBLIC])
+
+    def test_account_unchecked_is_skipped(self):
+        # account_block omitted -> no account-level finding emitted.
+        issues = check_s3_public_access([], _FakePublicS3Client())
+        self.assertEqual(issues, [CLEAN_PUBLIC])
+
+    def test_bucket_bpa_off_with_public_acl_is_high(self):
+        s3 = _FakePublicS3Client(
+            blocks={"b": None},
+            acls={"b": {"Grants": [_ALL_USERS_GRANT]}},
+        )
+        issues = check_s3_public_access([{"Name": "b"}], s3)
+        self.assertTrue(
+            any(i.startswith("[HIGH]") and "ACL" in i and "b" in i for i in issues)
+        )
+
+    def test_bucket_bpa_off_with_public_policy_is_high(self):
+        s3 = _FakePublicS3Client(
+            blocks={"b": None}, policies={"b": _public_policy()}
+        )
+        issues = check_s3_public_access([{"Name": "b"}], s3)
+        self.assertTrue(
+            any(i.startswith("[HIGH]") and "bucket policy" in i for i in issues)
+        )
+
+    def test_bucket_bpa_off_nothing_public_is_medium_latent(self):
+        s3 = _FakePublicS3Client(blocks={"b": None})
+        issues = check_s3_public_access([{"Name": "b"}], s3)
+        self.assertTrue(
+            any(i.startswith("[MEDIUM]") and "latent" in i for i in issues)
+        )
+
+    def test_bucket_bpa_fully_enabled_is_skipped(self):
+        # BPA fully on neutralises a public ACL -> no per-bucket finding.
+        s3 = _FakePublicS3Client(
+            blocks={"b": _BPA_FULL},
+            acls={"b": {"Grants": [_ALL_USERS_GRANT]}},
+        )
+        issues = check_s3_public_access([{"Name": "b"}], s3)
+        self.assertEqual(issues, [CLEAN_PUBLIC])
+
+    def test_public_policy_with_condition_is_not_high(self):
+        s3 = _FakePublicS3Client(
+            blocks={"b": None},
+            policies={
+                "b": _public_policy(
+                    condition={"IpAddress": {"aws:SourceIp": "203.0.113.0/24"}}
+                )
+            },
+        )
+        issues = check_s3_public_access([{"Name": "b"}], s3)
+        # A restricting condition scopes the grant -> latent (MEDIUM), not HIGH.
+        self.assertTrue(any(i.startswith("[MEDIUM]") for i in issues))
+        self.assertFalse(any(i.startswith("[HIGH]") for i in issues))
+
+    def test_partial_bpa_counts_as_not_fully_enabled(self):
+        partial = dict(_BPA_FULL, RestrictPublicBuckets=False)
+        s3 = _FakePublicS3Client(blocks={"b": partial})
+        issues = check_s3_public_access([{"Name": "b"}], s3)
+        self.assertTrue(
+            any("RestrictPublicBuckets" in i and "latent" in i for i in issues)
+        )
+
+    def test_no_buckets_and_account_full_is_clean(self):
+        self.assertEqual(
+            check_s3_public_access([], _FakePublicS3Client(), account_block=_BPA_FULL),
+            [CLEAN_PUBLIC],
+        )
 
 
 class TestSecurityGroupsCheck(unittest.TestCase):

@@ -17,7 +17,7 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger("ramwingu.aws")
 
 
-def check_instance_metadata(instances):
+def check_instance_metadata(instances, admin_profile_arns=frozenset()):
     """
     Checks EC2 instances for weak Instance Metadata Service (IMDS) settings.
 
@@ -27,29 +27,49 @@ def check_instance_metadata(instances):
     credentials. Enforcing IMDSv2 (``HttpTokens=required``) and a low hop limit is
     the durable defense.
 
+    Enforcement alone is necessary but not sufficient: CVE-2026-40175 (axios
+    header-injection chain, CVSS 9.9) showed an SSRF can be smuggled past IMDSv2's
+    token PUT, and the blast radius of any such theft equals the privileges of the
+    instance's IAM role. Each IMDSv1 finding is therefore annotated with the
+    attached instance-profile ARN, and escalated when that profile's role is broad.
+
     :param instances: List of EC2 instance dicts (from ``describe_instances``).
+    :param admin_profile_arns: Set of instance-profile ARNs whose attached role
+        grants broad/admin access (resolved in ``scan`` via the step-3 IAM logic);
+        an IMDSv1 instance using one of these has critical blast radius.
     :return: List of detected issues.
     """
     issues = []
     for instance in instances:
         instance_id = instance.get("InstanceId", "Unknown")
         options = instance.get("MetadataOptions", {})
+        profile_arn = instance.get("IamInstanceProfile", {}).get("Arn")
 
         # IMDSv1 still usable -> an SSRF can mint credential tokens (high risk).
         if options.get("HttpTokens") != "required":
-            issues.append(
-                f"EC2 instance {instance_id} allows IMDSv1 "
+            message = (
+                f"[HIGH] EC2 instance {instance_id} allows IMDSv1 "
                 f"(MetadataOptions.HttpTokens is "
                 f"'{options.get('HttpTokens', 'optional')}', not 'required'); "
-                f"enforce IMDSv2 to prevent SSRF credential theft."
+                f"enforce IMDSv2 to prevent SSRF credential theft (CVE-2026-40175)."
             )
+            if profile_arn and profile_arn in admin_profile_arns:
+                message += (
+                    f" Blast radius is critical: attached instance profile "
+                    f"{profile_arn} grants AdministratorAccess."
+                )
+            elif profile_arn:
+                message += f" Attached instance profile: {profile_arn}."
+            else:
+                message += " No instance profile is attached (no role credentials to steal)."
+            issues.append(message)
 
         # Permissive hop limit while the endpoint is reachable (lower-signal note).
         if options.get("HttpEndpoint", "enabled") != "disabled":
             hop_limit = options.get("HttpPutResponseHopLimit")
             if isinstance(hop_limit, int) and hop_limit > 1:
                 issues.append(
-                    f"EC2 instance {instance_id} has a metadata hop limit of "
+                    f"[MEDIUM] EC2 instance {instance_id} has a metadata hop limit of "
                     f"{hop_limit} (greater than 1); lower it to 1 unless containers "
                     f"on the host require more."
                 )
@@ -143,6 +163,171 @@ def check_bucket_policy_confused_deputy(buckets, s3_client):
 
     if not issues:
         issues.append("No confused-deputy S3 bucket policies found.")
+    return issues
+
+
+# The four S3 Block Public Access (BPA) flags. All must be True for BPA to be
+# fully enabled -- AWS's single most important S3 guardrail. While it is fully on,
+# no public ACL or bucket policy can take effect, so a gap here is what lets the
+# other public-exposure vectors matter at all.
+_BPA_FLAGS = (
+    "BlockPublicAcls",
+    "IgnorePublicAcls",
+    "BlockPublicPolicy",
+    "RestrictPublicBuckets",
+)
+
+# Sentinel: account-level BPA was not checked (e.g. permissions) and should not be
+# reported, distinct from ``None`` which means "no account BPA configured" (a gap).
+_ACCOUNT_BPA_UNCHECKED = object()
+
+
+def _missing_bpa_flags(block_config):
+    """
+    Returns the BPA flags that are not explicitly ``True`` in a
+    PublicAccessBlockConfiguration. A missing/empty config means BPA is unset, so
+    every flag is reported as missing.
+
+    :param block_config: A PublicAccessBlockConfiguration dict, or a falsy value.
+    :return: List of missing flag names ([] means BPA is fully enabled).
+    """
+    if not block_config:
+        return list(_BPA_FLAGS)
+    return [flag for flag in _BPA_FLAGS if block_config.get(flag) is not True]
+
+
+def _acl_grants_public(acl):
+    """True if a bucket ACL grants access to the public ``AllUsers`` group."""
+    for grant in acl.get("Grants", []):
+        grantee = grant.get("Grantee", {})
+        if grantee.get("Type") == "Group" and "AllUsers" in grantee.get("URI", ""):
+            return True
+    return False
+
+
+def _policy_grants_public(policy_document):
+    """
+    True if a bucket policy has an ``Allow`` statement open to everyone
+    (``Principal: "*"`` or ``AWS: "*"``) with no restricting ``Condition``.
+
+    A condition (e.g. a source-VPC or IP bound) scopes the access, so such
+    statements are not treated as world-public here.
+    """
+    statements = policy_document.get("Statement", [])
+    if isinstance(statements, dict):  # a lone statement may be a bare object
+        statements = [statements]
+
+    for statement in statements:
+        if statement.get("Effect") != "Allow":
+            continue
+        if statement.get("Condition"):
+            continue  # a restricting condition scopes the grant
+
+        principal = statement.get("Principal")
+        if principal == "*":
+            return True
+        if isinstance(principal, dict):
+            aws_principal = principal.get("AWS")
+            if aws_principal == "*" or (
+                isinstance(aws_principal, list) and "*" in aws_principal
+            ):
+                return True
+    return False
+
+
+def _live_public_vectors(bucket_name, s3_client, issues):
+    """
+    Returns the live public-exposure vectors for a bucket -- any of ``"ACL"`` and
+    ``"bucket policy"`` that currently grant world access. Unexpected API errors
+    are appended to ``issues`` so they surface as findings rather than vanish.
+    """
+    vectors = []
+    try:
+        if _acl_grants_public(s3_client.get_bucket_acl(Bucket=bucket_name)):
+            vectors.append("ACL")
+    except ClientError as e:
+        issues.append(f"Error checking ACL for {bucket_name}: {str(e)}")
+
+    try:
+        policy_response = s3_client.get_bucket_policy(Bucket=bucket_name)
+        policy_document = json.loads(policy_response.get("Policy", "{}"))
+        if _policy_grants_public(policy_document):
+            vectors.append("bucket policy")
+    except ClientError as e:
+        # A bucket with no policy is the common case, not a finding.
+        if e.response.get("Error", {}).get("Code") != "NoSuchBucketPolicy":
+            issues.append(f"Error checking bucket policy for {bucket_name}: {str(e)}")
+    return vectors
+
+
+def check_s3_public_access(buckets, s3_client, account_block=_ACCOUNT_BPA_UNCHECKED):
+    """
+    Flags S3 public-exposure gaps that the ACL-only check misses, centred on Block
+    Public Access (BPA) -- the guardrail AWS itself flags first.
+
+    Reports, with inline severity:
+
+    - Account-level BPA not fully enabled -> ``[MEDIUM]`` (public ACLs/policies are
+      able to take effect across the account).
+    - A bucket whose BPA is not fully enabled *and* that is already public via an
+      ``AllUsers`` ACL or a ``Principal: "*"`` policy -> ``[HIGH]``.
+    - A bucket whose BPA is not fully enabled with nothing public yet ->
+      ``[MEDIUM]`` (latent exposure).
+
+    A bucket with BPA fully enabled is skipped: BPA neutralises any public ACL or
+    policy, so there is no live exposure to report.
+
+    :param buckets: List of bucket dicts (from ``list_buckets``).
+    :param s3_client: An initialized boto3 S3 client.
+    :param account_block: The account-level PublicAccessBlockConfiguration dict,
+        ``None`` if none is configured, or left unset to skip the account check.
+    :return: List of detected issues.
+    """
+    issues = []
+
+    if account_block is not _ACCOUNT_BPA_UNCHECKED:
+        account_missing = _missing_bpa_flags(account_block)
+        if account_missing:
+            issues.append(
+                f"[MEDIUM] Account-level S3 Block Public Access is not fully enabled "
+                f"(missing: {', '.join(account_missing)}); public ACLs or bucket "
+                f"policies are able to take effect on buckets in this account."
+            )
+
+    for bucket in buckets:
+        bucket_name = bucket.get("Name")
+        try:
+            response = s3_client.get_public_access_block(Bucket=bucket_name)
+            bucket_block = response.get("PublicAccessBlockConfiguration", {})
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            if code != "NoSuchPublicAccessBlockConfiguration":
+                issues.append(
+                    f"Error checking Block Public Access for {bucket_name}: {str(e)}"
+                )
+                continue
+            bucket_block = {}  # no BPA configured -> every flag missing
+
+        bucket_missing = _missing_bpa_flags(bucket_block)
+        if not bucket_missing:
+            continue  # BPA fully enabled neutralises any public ACL/policy
+
+        vectors = _live_public_vectors(bucket_name, s3_client, issues)
+        if vectors:
+            issues.append(
+                f"[HIGH] S3 bucket {bucket_name} is publicly exposed via "
+                f"{' and '.join(vectors)} and Block Public Access is not fully "
+                f"enabled (missing: {', '.join(bucket_missing)})."
+            )
+        else:
+            issues.append(
+                f"[MEDIUM] S3 bucket {bucket_name} has Block Public Access not fully "
+                f"enabled (missing: {', '.join(bucket_missing)}); latent "
+                f"public-exposure risk."
+            )
+
+    if not issues:
+        issues.append("No public S3 access exposure found.")
     return issues
 
 
@@ -288,7 +473,18 @@ def scan(config, creds):
             aws_access_key_id=creds.get("aws_access_key_id"),
             aws_secret_access_key=creds.get("aws_secret_access_key")
         )
-        
+        s3control_client = boto3.client(
+            "s3control",
+            region_name=region,
+            aws_access_key_id=creds.get("aws_access_key_id"),
+            aws_secret_access_key=creds.get("aws_secret_access_key")
+        )
+        sts_client = boto3.client(
+            "sts",
+            aws_access_key_id=creds.get("aws_access_key_id"),
+            aws_secret_access_key=creds.get("aws_secret_access_key")
+        )
+
         # ------------------------------
         # 1. Check Security Groups
         # ------------------------------
@@ -317,6 +513,33 @@ def scan(config, creds):
         findings["s3_buckets"] = s3_findings
 
         # ------------------------------
+        # 2b. Check S3 public access (Block Public Access + public policy/ACL)
+        # ------------------------------
+        # Account-level BPA is the highest guardrail; resolve it once. A missing
+        # configuration (NoSuchPublicAccessBlockConfiguration) means BPA is off and
+        # is reported, whereas a permissions failure leaves it unchecked.
+        account_block = _ACCOUNT_BPA_UNCHECKED
+        try:
+            account_id = sts_client.get_caller_identity().get("Account")
+            if account_id:
+                try:
+                    account_block = s3control_client.get_public_access_block(
+                        AccountId=account_id
+                    ).get("PublicAccessBlockConfiguration", {})
+                except ClientError as e:
+                    if e.response.get("Error", {}).get("Code") == (
+                        "NoSuchPublicAccessBlockConfiguration"
+                    ):
+                        account_block = None
+                    else:
+                        logger.warning("Could not fetch account-level S3 BPA: %s", e)
+        except ClientError as e:
+            logger.warning("Could not resolve account id for S3 BPA: %s", e)
+        findings["s3_public_access"] = check_s3_public_access(
+            buckets, s3_client, account_block
+        )
+
+        # ------------------------------
         # 3. Check IAM Policies
         # ------------------------------
         iam_response = iam_client.list_users()
@@ -343,7 +566,40 @@ def scan(config, creds):
         instances_response = ec2_client.describe_instances()
         for reservation in instances_response.get("Reservations", []):
             instances.extend(reservation.get("Instances", []))
-        findings["instance_metadata"] = check_instance_metadata(instances)
+
+        # Blast-radius context (CVE-2026-40175): resolve which attached instance
+        # profiles grant broad access so an IMDSv1 finding can be escalated. Reuses
+        # the step-3 "AdministratorAccess" heuristic, once per distinct profile.
+        admin_profile_arns = set()
+        profile_arns = {
+            inst["IamInstanceProfile"]["Arn"]
+            for inst in instances
+            if inst.get("IamInstanceProfile", {}).get("Arn")
+        }
+        for profile_arn in profile_arns:
+            profile_name = profile_arn.split("/")[-1]
+            try:
+                profile = iam_client.get_instance_profile(
+                    InstanceProfileName=profile_name
+                ).get("InstanceProfile", {})
+                for role in profile.get("Roles", []):
+                    attached = iam_client.list_attached_role_policies(
+                        RoleName=role.get("RoleName")
+                    ).get("AttachedPolicies", [])
+                    if any(
+                        "AdministratorAccess" in p.get("PolicyName", "")
+                        for p in attached
+                    ):
+                        admin_profile_arns.add(profile_arn)
+                        break
+            except ClientError as e:
+                logger.warning(
+                    "Could not resolve instance profile %s: %s", profile_name, e
+                )
+
+        findings["instance_metadata"] = check_instance_metadata(
+            instances, admin_profile_arns
+        )
 
         # ------------------------------
         # 5. Check S3 Bucket Policies (cross-service confused deputy)
