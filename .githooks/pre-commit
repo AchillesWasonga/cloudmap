@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Version-controlled pre-commit hook for ramwingu.
+# Enable once per clone with:  git config core.hooksPath .githooks
+#
+# When a scanner or scanner test is part of the commit, it runs the structural
+# validator and the scanner unit tests, so a broken or rule-violating check
+# never reaches a teammate's checkout.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+
+# Only run when a scanner or a scanner test is staged.
+staged="$(git diff --cached --name-only --diff-filter=ACM \
+  | grep -E '^ramwingu/scanners/.*\.py$|^ramwingu/credentials\.py$|^tests/tests_.*\.py$' || true)"
+
+if [[ -z "$staged" ]]; then
+  exit 0
+fi
+
+echo "pre-commit: validating ramwingu checks…"
+if ! "$ROOT/.claude/scripts/validate-checks.sh"; then
+  echo
+  echo "pre-commit: check validation failed. Fix the errors above or bypass with 'git commit --no-verify'."
+  exit 1
+fi
+
+echo "pre-commit: running scanner tests…"
+if ! "$ROOT/.claude/skills/add-check/scripts/run-check-tests.sh"; then
+  echo
+  echo "pre-commit: scanner tests failed. Fix them or bypass with 'git commit --no-verify'."
+  exit 1
+fi
