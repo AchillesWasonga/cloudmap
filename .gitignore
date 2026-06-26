@@ -27,8 +27,12 @@ coverage.xml
 *.manifest
 *.spec
 
-# Claude Code
-.claude/
+# Claude Code — keep local/private state out of git, but DO share the project's
+# skills, subagents, and validation tooling (this is an open-source project).
+.claude/*
+!.claude/skills/
+!.claude/agents/
+!.claude/scripts/
 
 # Editor directories and files
 .vscode/
