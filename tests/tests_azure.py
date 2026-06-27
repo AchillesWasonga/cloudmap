@@ -15,6 +15,8 @@ class _FakeProps:
         allow_blob_public_access=None,
         public_network_access=None,
         network_default_action=None,
+        require_infrastructure_encryption=None,
+        key_source=None,
     ):
         self.allow_shared_key_access = allow_shared_key_access
         self.allow_blob_public_access = allow_blob_public_access
@@ -25,6 +27,14 @@ class _FakeProps:
             self.network_rule_set = type(
                 "NRS", (), {"default_action": network_default_action}
             )()
+        self.encryption = type(
+            "Enc",
+            (),
+            {
+                "require_infrastructure_encryption": require_infrastructure_encryption,
+                "key_source": key_source,
+            },
+        )()
 
 
 class _FakeAccount:
@@ -56,12 +66,15 @@ def _client_with(props):
     return _FakeStorageClient([_FakeAccount("acct1", "rg1")], {"acct1": props})
 
 
-# A fully hardened baseline: Shared Key disabled, no public blob, network locked down.
+# A fully hardened baseline: Shared Key disabled, no public blob, network locked
+# down, infrastructure encryption on, and a customer-managed key.
 def _hardened(**overrides):
     base = dict(
         allow_shared_key_access=False,
         allow_blob_public_access=False,
         public_network_access="Disabled",
+        require_infrastructure_encryption=True,
+        key_source="Microsoft.Keyvault",
     )
     base.update(overrides)
     return _FakeProps(**base)
@@ -213,10 +226,36 @@ class TestStorageAccountsCheck(unittest.TestCase):
                 allow_blob_public_access=True,
                 public_network_access="Enabled",
                 network_default_action="Allow",
+                # Hardened encryption so this test stays focused on the three
+                # data-plane findings.
+                require_infrastructure_encryption=True,
+                key_source="Microsoft.Keyvault",
             )
         )
         issues = check_storage_accounts(client)
         self.assertEqual(len(issues), 3)
+
+    def test_flags_no_infrastructure_encryption(self):
+        client = _client_with(_hardened(require_infrastructure_encryption=False))
+        issues = check_storage_accounts(client)
+        self.assertTrue(
+            any(i.startswith("[LOW]") and "infrastructure" in i for i in issues)
+        )
+
+    def test_flags_microsoft_managed_keys(self):
+        client = _client_with(_hardened(key_source="Microsoft.Storage"))
+        issues = check_storage_accounts(client)
+        self.assertTrue(
+            any(i.startswith("[LOW]") and "customer-managed key" in i for i in issues)
+        )
+
+    def test_null_encryption_flags_both_low(self):
+        # No encryption block at all -> both hardening findings, both LOW.
+        client = _client_with(
+            _hardened(require_infrastructure_encryption=None, key_source=None)
+        )
+        issues = check_storage_accounts(client)
+        self.assertEqual(sum(i.startswith("[LOW]") for i in issues), 2)
 
     def test_no_accounts_is_clean(self):
         client = _FakeStorageClient([], {})

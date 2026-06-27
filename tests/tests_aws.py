@@ -6,7 +6,10 @@ from botocore.exceptions import ClientError
 from ramwingu.scanners import aws
 from ramwingu.scanners.aws import (
     check_bucket_policy_confused_deputy,
+    check_cloudtrail,
     check_instance_metadata,
+    check_lambda_function_urls,
+    check_role_privileges,
     check_s3_public_access,
     check_security_groups,
 )
@@ -15,6 +18,9 @@ CLEAN_METADATA = "No insecure EC2 instance metadata configurations found."
 CLEAN_POLICY = "No confused-deputy S3 bucket policies found."
 CLEAN_SG = "No overly permissive security group rules found."
 CLEAN_PUBLIC = "No public S3 access exposure found."
+CLEAN_LAMBDA = "No publicly invokable Lambda Function URLs found."
+CLEAN_CLOUDTRAIL = "No CloudTrail logging gaps found."
+CLEAN_ROLES = "No over-privileged EC2 instance-profile roles found."
 
 _ALL_USERS_GRANT = {
     "Grantee": {
@@ -530,6 +536,165 @@ class TestBucketPolicyConfusedDeputy(unittest.TestCase):
         self.assertEqual(
             check_bucket_policy_confused_deputy([], _FakeS3Client({})), [CLEAN_POLICY]
         )
+
+
+class _FakeLambdaClient:
+    """Stand-in for a boto3 Lambda client over get_function_url_config.
+
+    ``url_configs`` maps a function name to a Function-URL-config dict; map to
+    ``None`` to simulate a function with no URL (boto3 raises
+    ``ResourceNotFoundException``).
+    """
+
+    def __init__(self, url_configs):
+        self._url_configs = url_configs
+
+    def get_function_url_config(self, FunctionName):
+        config = self._url_configs.get(FunctionName)
+        if config is None:
+            raise ClientError(
+                {"Error": {"Code": "ResourceNotFoundException", "Message": "no url"}},
+                "GetFunctionUrlConfig",
+            )
+        return config
+
+
+class TestLambdaFunctionUrls(unittest.TestCase):
+    def test_flags_authtype_none_as_high(self):
+        client = _FakeLambdaClient(
+            {"fn": {"AuthType": "NONE", "FunctionUrl": "https://x.lambda-url.on.aws/"}}
+        )
+        issues = check_lambda_function_urls([{"FunctionName": "fn"}], client)
+        self.assertTrue(
+            any(i.startswith("[HIGH]") and "fn" in i and "AuthType NONE" in i for i in issues)
+        )
+
+    def test_authtype_iam_is_clean(self):
+        client = _FakeLambdaClient({"fn": {"AuthType": "AWS_IAM"}})
+        self.assertEqual(
+            check_lambda_function_urls([{"FunctionName": "fn"}], client), [CLEAN_LAMBDA]
+        )
+
+    def test_function_without_url_is_clean(self):
+        client = _FakeLambdaClient({"fn": None})
+        self.assertEqual(
+            check_lambda_function_urls([{"FunctionName": "fn"}], client), [CLEAN_LAMBDA]
+        )
+
+    def test_no_functions_is_clean(self):
+        self.assertEqual(
+            check_lambda_function_urls([], _FakeLambdaClient({})), [CLEAN_LAMBDA]
+        )
+
+
+class _FakeCloudTrailClient:
+    """Stand-in for a boto3 CloudTrail client over get_trail_status.
+
+    ``statuses`` maps a trail name/ARN to a get_trail_status response.
+    """
+
+    def __init__(self, statuses=None):
+        self._statuses = statuses or {}
+
+    def get_trail_status(self, Name):
+        return self._statuses.get(Name, {"IsLogging": False})
+
+
+def _trail(name="t1", multiregion=True, validation=True):
+    arn = f"arn:aws:cloudtrail:us-east-1:111122223333:trail/{name}"
+    return {
+        "Name": name,
+        "TrailARN": arn,
+        "IsMultiRegionTrail": multiregion,
+        "LogFileValidationEnabled": validation,
+    }
+
+
+class TestCloudTrail(unittest.TestCase):
+    def test_no_trails_is_high(self):
+        issues = check_cloudtrail([], _FakeCloudTrailClient())
+        self.assertTrue(any(i.startswith("[HIGH]") and "No CloudTrail" in i for i in issues))
+
+    def test_multiregion_logging_trail_is_clean(self):
+        trail = _trail()
+        client = _FakeCloudTrailClient({trail["TrailARN"]: {"IsLogging": True}})
+        self.assertEqual(check_cloudtrail([trail], client), [CLEAN_CLOUDTRAIL])
+
+    def test_single_region_trail_is_high(self):
+        trail = _trail(multiregion=False)
+        client = _FakeCloudTrailClient({trail["TrailARN"]: {"IsLogging": True}})
+        issues = check_cloudtrail([trail], client)
+        self.assertTrue(
+            any(i.startswith("[HIGH]") and "multi-region" in i for i in issues)
+        )
+
+    def test_not_logging_trail_is_high(self):
+        trail = _trail()
+        client = _FakeCloudTrailClient({trail["TrailARN"]: {"IsLogging": False}})
+        issues = check_cloudtrail([trail], client)
+        self.assertTrue(any(i.startswith("[HIGH]") for i in issues))
+
+    def test_no_log_file_validation_is_medium(self):
+        trail = _trail(validation=False)
+        client = _FakeCloudTrailClient({trail["TrailARN"]: {"IsLogging": True}})
+        issues = check_cloudtrail([trail], client)
+        self.assertTrue(
+            any(i.startswith("[MEDIUM]") and "validation" in i for i in issues)
+        )
+
+
+def _role_doc(action, resource, effect="Allow"):
+    return {
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": effect, "Action": action, "Resource": resource}],
+    }
+
+
+class TestRolePrivileges(unittest.TestCase):
+    def test_full_wildcard_is_high(self):
+        roles = [{"RoleName": "r", "PolicyDocuments": [_role_doc("*", "*")]}]
+        issues = check_role_privileges(roles)
+        self.assertTrue(
+            any(i.startswith("[HIGH]") and "full wildcard" in i and "r" in i for i in issues)
+        )
+
+    def test_iam_wildcard_is_high(self):
+        roles = [{"RoleName": "r", "PolicyDocuments": [_role_doc("iam:*", "*")]}]
+        issues = check_role_privileges(roles)
+        self.assertTrue(any(i.startswith("[HIGH]") and "iam:*" in i for i in issues))
+
+    def test_broad_assume_role_is_medium(self):
+        roles = [{"RoleName": "r", "PolicyDocuments": [_role_doc("sts:AssumeRole", "*")]}]
+        issues = check_role_privileges(roles)
+        self.assertTrue(
+            any(i.startswith("[MEDIUM]") and "assume any role" in i for i in issues)
+        )
+
+    def test_full_admin_suppresses_assume_medium(self):
+        # A statement that is full admin should not also emit the MEDIUM assume note.
+        roles = [
+            {
+                "RoleName": "r",
+                "PolicyDocuments": [_role_doc(["*", "sts:AssumeRole"], "*")],
+            }
+        ]
+        issues = check_role_privileges(roles)
+        self.assertTrue(any(i.startswith("[HIGH]") for i in issues))
+        self.assertFalse(any(i.startswith("[MEDIUM]") for i in issues))
+
+    def test_scoped_policy_is_clean(self):
+        roles = [
+            {
+                "RoleName": "r",
+                "PolicyDocuments": [
+                    _role_doc("s3:GetObject", "arn:aws:s3:::bucket/*")
+                ],
+            }
+        ]
+        self.assertEqual(check_role_privileges(roles), [CLEAN_ROLES])
+
+    def test_no_roles_is_clean(self):
+        self.assertEqual(check_role_privileges([]), [CLEAN_ROLES])
 
 
 if __name__ == "__main__":

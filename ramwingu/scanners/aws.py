@@ -443,6 +443,230 @@ def check_security_groups(security_groups):
     return issues
 
 
+def check_lambda_function_urls(functions, lambda_client):
+    """
+    Flags Lambda functions exposed through a public Function URL with no auth.
+
+    A Function URL with ``AuthType: NONE`` lets anyone on the internet invoke the
+    function -- data access, abuse-driven cost, and (per the June 2026 "HazyBeacon"
+    reporting) command-and-control hosting. Thousands of such URLs are passively
+    enumerable over ``*.lambda-url.*.on.aws``. The fix is to require ``AWS_IAM``
+    auth or remove the URL.
+
+    :param functions: List of function dicts (from ``list_functions``).
+    :param lambda_client: An initialized boto3 Lambda client (for
+        ``get_function_url_config``).
+    :return: List of detected issues.
+    """
+    issues = []
+    for function in functions:
+        name = function.get("FunctionName", "Unknown")
+        try:
+            url_config = lambda_client.get_function_url_config(FunctionName=name)
+        except ClientError as e:
+            # No Function URL configured is the common case, not a finding.
+            if e.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+                continue
+            issues.append(f"Error checking Function URL for {name}: {str(e)}")
+            continue
+
+        if url_config.get("AuthType") == "NONE":
+            url = url_config.get("FunctionUrl", "")
+            issues.append(
+                f"[HIGH] Lambda function {name} has a public Function URL with "
+                f"AuthType NONE ({url}); anyone on the internet can invoke it. "
+                f"Require AWS_IAM auth or remove the URL."
+            )
+
+    if not issues:
+        issues.append("No publicly invokable Lambda Function URLs found.")
+    return issues
+
+
+def check_cloudtrail(trails, cloudtrail_client):
+    """
+    Flags gaps in CloudTrail coverage -- the API audit trail a responder needs.
+
+    With no enabled multi-region trail there is no record of API activity, so
+    credential theft, IAM changes, and public-resource flips happen invisibly.
+    Reports, with inline severity:
+
+    - No trail at all, or none that is both multi-region and actively logging ->
+      ``[HIGH]``.
+    - A trail without log-file validation -> ``[MEDIUM]`` (delivered logs can be
+      tampered with undetected).
+
+    :param trails: List of trail dicts (from ``describe_trails`` ``trailList``).
+    :param cloudtrail_client: An initialized boto3 CloudTrail client (for
+        ``get_trail_status``).
+    :return: List of detected issues.
+    """
+    issues = []
+    if not trails:
+        issues.append(
+            "[HIGH] No CloudTrail trail is configured; there is no API audit "
+            "trail, so credential theft, IAM changes, and public-resource changes "
+            "happen with no record. Enable a multi-region trail with logging on."
+        )
+        return issues
+
+    has_multiregion_logging = False
+    for trail in trails:
+        name = trail.get("Name", "Unknown")
+        try:
+            status = cloudtrail_client.get_trail_status(
+                Name=trail.get("TrailARN") or name
+            )
+            is_logging = status.get("IsLogging", False)
+        except ClientError as e:
+            issues.append(f"Error checking trail status for {name}: {str(e)}")
+            is_logging = False
+
+        if trail.get("IsMultiRegionTrail") and is_logging:
+            has_multiregion_logging = True
+
+        if not trail.get("LogFileValidationEnabled", False):
+            issues.append(
+                f"[MEDIUM] CloudTrail trail {name} does not have log-file "
+                f"validation enabled; tampering with delivered logs can go "
+                f"undetected. Enable LogFileValidationEnabled."
+            )
+
+    if not has_multiregion_logging:
+        issues.append(
+            "[HIGH] No CloudTrail trail is both multi-region and actively logging; "
+            "API activity in unmonitored regions is not recorded. Enable a "
+            "multi-region trail with logging on."
+        )
+
+    if not issues:
+        issues.append("No CloudTrail logging gaps found.")
+    return issues
+
+
+def _allow_statements(policy_document):
+    """Returns the ``Allow`` statements of a parsed IAM policy document, coercing a
+    lone statement object into a single-item list."""
+    statements = policy_document.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    return [
+        s for s in statements if isinstance(s, dict) and s.get("Effect") == "Allow"
+    ]
+
+
+def _statement_actions(statement):
+    """Returns a statement's actions, lower-cased, as a list."""
+    actions = statement.get("Action", [])
+    if isinstance(actions, str):
+        actions = [actions]
+    return [str(a).lower() for a in actions]
+
+
+def _statement_resources(statement):
+    """Returns a statement's resources as a list of strings."""
+    resources = statement.get("Resource", [])
+    if isinstance(resources, str):
+        resources = [resources]
+    return [str(r) for r in resources]
+
+
+def check_role_privileges(roles):
+    """
+    Flags over-privileged IAM roles attached to EC2 instance profiles.
+
+    The blast radius of stolen instance credentials (e.g. via the IMDS/SSRF chain
+    in :func:`check_instance_metadata`) equals the privileges of the instance's
+    role, but the user-focused IAM scan only flags ``AdministratorAccess`` on
+    users. This parses the attached/inline policy documents of instance-profile
+    roles and flags, with inline severity:
+
+    - ``Action: "*"`` on ``Resource: "*"`` (full administrative wildcard) ->
+      ``[HIGH]``.
+    - ``iam:*`` (privilege-escalation surface) -> ``[HIGH]``.
+    - ``sts:AssumeRole`` on ``Resource: "*"`` (broad lateral movement) ->
+      ``[MEDIUM]``.
+
+    :param roles: List of dicts shaped ``{"RoleName": str, "PolicyDocuments":
+        [parsed policy dicts]}`` (gathered in ``scan`` for instance-profile roles).
+    :return: List of detected issues.
+    """
+    issues = []
+    for role in roles:
+        name = role.get("RoleName", "Unknown")
+        full_admin = iam_wildcard = broad_assume = False
+        for document in role.get("PolicyDocuments", []):
+            for statement in _allow_statements(document):
+                actions = _statement_actions(statement)
+                wildcard_resource = "*" in _statement_resources(statement)
+                if "*" in actions and wildcard_resource:
+                    full_admin = True
+                if "iam:*" in actions:
+                    iam_wildcard = True
+                if "sts:assumerole" in actions and wildcard_resource:
+                    broad_assume = True
+
+        if full_admin:
+            issues.append(
+                f"[HIGH] IAM role {name} (attached to an EC2 instance profile) "
+                f"grants full wildcard access (Action '*' on Resource '*'); stolen "
+                f"instance credentials would inherit administrator-equivalent power."
+            )
+        elif iam_wildcard:
+            issues.append(
+                f"[HIGH] IAM role {name} (attached to an EC2 instance profile) "
+                f"grants 'iam:*'; stolen instance credentials could escalate "
+                f"privileges (create users/keys, attach policies)."
+            )
+        if broad_assume and not full_admin:
+            issues.append(
+                f"[MEDIUM] IAM role {name} (attached to an EC2 instance profile) "
+                f"can assume any role (sts:AssumeRole on Resource '*'); broad "
+                f"lateral-movement surface if the credentials are stolen."
+            )
+
+    if not issues:
+        issues.append("No over-privileged EC2 instance-profile roles found.")
+    return issues
+
+
+def _fetch_role_policy_documents(iam_client, role_name, attached_policies):
+    """
+    Gathers the parsed policy documents for a role -- both attached managed
+    policies (resolved to their default version) and inline policies. Used by
+    ``scan`` to feed :func:`check_role_privileges`.
+
+    :param iam_client: An initialized boto3 IAM client.
+    :param role_name: The role to resolve.
+    :param attached_policies: The already-fetched ``AttachedPolicies`` list (passed
+        in to avoid re-calling ``list_attached_role_policies``).
+    :return: List of parsed policy-document dicts.
+    """
+    documents = []
+    for policy in attached_policies:
+        arn = policy.get("PolicyArn")
+        if not arn:
+            continue
+        version_id = (
+            iam_client.get_policy(PolicyArn=arn).get("Policy", {}).get("DefaultVersionId")
+        )
+        if version_id:
+            document = (
+                iam_client.get_policy_version(PolicyArn=arn, VersionId=version_id)
+                .get("PolicyVersion", {})
+                .get("Document", {})
+            )
+            documents.append(document)
+    for policy_name in iam_client.list_role_policies(RoleName=role_name).get(
+        "PolicyNames", []
+    ):
+        document = iam_client.get_role_policy(
+            RoleName=role_name, PolicyName=policy_name
+        ).get("PolicyDocument", {})
+        documents.append(document)
+    return documents
+
+
 def scan(config, creds):
     """
     Performs an AWS scan for common misconfigurations.
@@ -481,6 +705,18 @@ def scan(config, creds):
         )
         sts_client = boto3.client(
             "sts",
+            aws_access_key_id=creds.get("aws_access_key_id"),
+            aws_secret_access_key=creds.get("aws_secret_access_key")
+        )
+        lambda_client = boto3.client(
+            "lambda",
+            region_name=region,
+            aws_access_key_id=creds.get("aws_access_key_id"),
+            aws_secret_access_key=creds.get("aws_secret_access_key")
+        )
+        cloudtrail_client = boto3.client(
+            "cloudtrail",
+            region_name=region,
             aws_access_key_id=creds.get("aws_access_key_id"),
             aws_secret_access_key=creds.get("aws_secret_access_key")
         )
@@ -571,6 +807,7 @@ def scan(config, creds):
         # profiles grant broad access so an IMDSv1 finding can be escalated. Reuses
         # the step-3 "AdministratorAccess" heuristic, once per distinct profile.
         admin_profile_arns = set()
+        roles_with_docs = []
         profile_arns = {
             inst["IamInstanceProfile"]["Arn"]
             for inst in instances
@@ -583,15 +820,22 @@ def scan(config, creds):
                     InstanceProfileName=profile_name
                 ).get("InstanceProfile", {})
                 for role in profile.get("Roles", []):
+                    role_name = role.get("RoleName")
                     attached = iam_client.list_attached_role_policies(
-                        RoleName=role.get("RoleName")
+                        RoleName=role_name
                     ).get("AttachedPolicies", [])
                     if any(
                         "AdministratorAccess" in p.get("PolicyName", "")
                         for p in attached
                     ):
                         admin_profile_arns.add(profile_arn)
-                        break
+                    # Gather the role's policy documents for the privilege check.
+                    roles_with_docs.append({
+                        "RoleName": role_name,
+                        "PolicyDocuments": _fetch_role_policy_documents(
+                            iam_client, role_name, attached
+                        ),
+                    })
             except ClientError as e:
                 logger.warning(
                     "Could not resolve instance profile %s: %s", profile_name, e
@@ -602,11 +846,30 @@ def scan(config, creds):
         )
 
         # ------------------------------
+        # 4b. Check IAM roles attached to EC2 instance profiles (blast radius)
+        # ------------------------------
+        findings["instance_profile_roles"] = check_role_privileges(roles_with_docs)
+
+        # ------------------------------
         # 5. Check S3 Bucket Policies (cross-service confused deputy)
         # ------------------------------
         findings["s3_bucket_policies"] = check_bucket_policy_confused_deputy(
             buckets, s3_client
         )
+
+        # ------------------------------
+        # 6. Check Lambda Function URLs (public, no-auth invocation)
+        # ------------------------------
+        functions = lambda_client.list_functions().get("Functions", [])
+        findings["lambda_function_urls"] = check_lambda_function_urls(
+            functions, lambda_client
+        )
+
+        # ------------------------------
+        # 7. Check CloudTrail (audit-logging posture)
+        # ------------------------------
+        trails = cloudtrail_client.describe_trails().get("trailList", [])
+        findings["cloudtrail"] = check_cloudtrail(trails, cloudtrail_client)
 
     except Exception as e:
         logger.error("Error during AWS scan: %s", e)

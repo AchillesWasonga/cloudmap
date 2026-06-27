@@ -296,6 +296,23 @@ def check_storage_accounts(storage_client):
                 f"network access."
             )
 
+        # 4. At-rest encryption hardening (defense-in-depth). Data is always
+        # encrypted, so these are LOW: a second encryption layer and key control.
+        encryption = getattr(props, "encryption", None)
+        if getattr(encryption, "require_infrastructure_encryption", None) is not True:
+            issues.append(
+                f"[LOW] Storage account {sa_name} (resource group {rg_name}) does not "
+                f"have infrastructure (double) encryption enabled; enable it for a "
+                f"second at-rest encryption layer."
+            )
+        key_source = getattr(encryption, "key_source", None)
+        if key_source is None or str(key_source).lower() == "microsoft.storage":
+            issues.append(
+                f"[LOW] Storage account {sa_name} (resource group {rg_name}) uses "
+                f"Microsoft-managed encryption keys (no customer-managed key); consider "
+                f"a customer-managed key (CMK) for key control and rotation."
+            )
+
     if not issues:
         issues.append("No insecure storage account configurations found.")
     return issues
